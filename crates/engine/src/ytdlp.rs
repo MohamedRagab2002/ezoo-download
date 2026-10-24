@@ -11,9 +11,12 @@ use crate::mux::{find_tool, hide_window};
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// One choice in the "Download this video" menu.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -380,7 +383,15 @@ pub fn netscape_cookies(cookies: &[BrowserCookie]) -> String {
 
 fn run_ytdlp(tool: &Path, page_url: &str, cookie_file: Option<&Path>) -> anyhow::Result<Value> {
     let mut cmd = Command::new(tool);
-    cmd.args(["-J", "--no-playlist", "--no-warnings", "--no-progress", "--socket-timeout", "20"]);
+    cmd.args([
+        "-J",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-progress",
+        "--ignore-config",
+        "--socket-timeout",
+        "20",
+    ]);
     if let Some(c) = cookie_file {
         cmd.arg("--cookies").arg(c);
     }
@@ -406,35 +417,124 @@ fn run_ytdlp(tool: &Path, page_url: &str, cookie_file: Option<&Path>) -> anyhow:
 
 fn needs_login(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    ["sign in", "log in", "login", "cookies", "age", "bot", "private", "registered users", "rate-limit", "empty media"]
-        .iter()
-        .any(|k| m.contains(k))
+    [
+        "sign in",
+        "log in",
+        "login",
+        "cookies",
+        "confirm your age",
+        "not a bot",
+        "private",
+        "registered users",
+        "rate-limit",
+        "empty media",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
-/// Find the download choices of a page with a video. Blocking (takes a few
-/// seconds). Tries without cookies first, and with the browser's cookies for
-/// that site only when the site asks for a login (Instagram, Facebook,
-/// age-limited YouTube videos, ...).
-pub fn resolve(page_url: &str, cookies: Option<&[BrowserCookie]>) -> anyhow::Result<YtInfo> {
+// ---------------------------------------------------------------- speed
+
+/// How long an answer is kept (the links stay valid for hours).
+const CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// One slot per page address: the same page asked twice at the same time
+/// waits for the first answer instead of starting yt-dlp again.
+type Slot = Arc<Mutex<Option<(Instant, YtInfo)>>>;
+static RESOLVE_CACHE: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+
+fn cache_slot(url: &str) -> Slot {
+    let map = RESOLVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 64 {
+        // forget old answers (but keep the ones being resolved right now)
+        map.retain(|_, s| match s.try_lock() {
+            Ok(g) => matches!(&*g, Some((t, _)) if t.elapsed() < CACHE_TTL),
+            Err(_) => true,
+        });
+    }
+    map.entry(url.to_string()).or_default().clone()
+}
+
+/// At most this many yt-dlp analyses at the same time (a feed can ask for many).
+const MAX_PARALLEL: usize = 3;
+static GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct Permit;
+
+fn acquire() -> Permit {
+    let (lock, cv) = &GATE;
+    let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while *n >= MAX_PARALLEL {
+        n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    *n += 1;
+    Permit
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let (lock, cv) = &GATE;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
+}
+
+/// Sites that almost always need a login: go straight to the cookies.
+fn prefers_cookies(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("instagram.com")
+}
+
+fn resolve_uncached(page_url: &str, cookies: Option<&[BrowserCookie]>) -> anyhow::Result<YtInfo> {
+    let _permit = acquire();
     let tool = find_tool("yt-dlp")
         .ok_or_else(|| anyhow!("yt-dlp.exe is missing. Ezoo Download gets it by itself in a minute (internet needed), then try again"))?;
-    let json = match run_ytdlp(&tool, page_url, None) {
-        Ok(j) => j,
-        Err(e) => match cookies.filter(|c| !c.is_empty()) {
-            Some(list) if needs_login(&e.to_string()) => {
-                let file = std::env::temp_dir().join(format!("ezoo-cookies-{}.txt", std::process::id()));
-                std::fs::write(&file, netscape_cookies(list))?;
-                let r = run_ytdlp(&tool, page_url, Some(&file));
-                let _ = std::fs::remove_file(&file);
-                r?
-            }
-            _ => return Err(e),
+    let cookies = cookies.filter(|c| !c.is_empty());
+    let with_cookies = |list: &[BrowserCookie]| -> anyhow::Result<Value> {
+        // a file of its own for every run, so two runs never delete each other's
+        static N: AtomicU64 = AtomicU64::new(0);
+        let file = std::env::temp_dir().join(format!(
+            "ezoo-cookies-{}-{}.txt",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file, netscape_cookies(list))?;
+        let r = run_ytdlp(&tool, page_url, Some(&file));
+        let _ = std::fs::remove_file(&file);
+        r
+    };
+    let json = match cookies {
+        Some(list) if prefers_cookies(page_url) => with_cookies(list)?,
+        _ => match run_ytdlp(&tool, page_url, None) {
+            Ok(j) => j,
+            Err(e) => match cookies {
+                Some(list) if needs_login(&e.to_string()) => with_cookies(list)?,
+                _ => return Err(e),
+            },
         },
     };
     let info = build_options(&json);
     if info.options.is_empty() {
         bail!("no downloadable video was found on this page");
     }
+    Ok(info)
+}
+
+/// Find the download choices of a page with a video. Blocking (takes a few
+/// seconds). Tries without cookies first, and with the browser's cookies for
+/// that site only when the site asks for a login (Instagram, Facebook,
+/// age-limited YouTube videos, ...). Answers are kept for 10 minutes, and the
+/// same page is never analysed twice at the same time.
+pub fn resolve(page_url: &str, cookies: Option<&[BrowserCookie]>) -> anyhow::Result<YtInfo> {
+    let slot = cache_slot(page_url);
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, info)) = guard.as_ref() {
+        if at.elapsed() < CACHE_TTL {
+            return Ok(info.clone());
+        }
+    }
+    let info = resolve_uncached(page_url, cookies)?;
+    *guard = Some((Instant::now(), info.clone()));
     Ok(info)
 }
 
@@ -717,5 +817,17 @@ mod tests {
         assert!(s.contains(".instagram.com\tTRUE\t/\tTRUE\t1900000000\tsessionid\tabc\n"));
         assert!(s.contains("www.x.com\tFALSE\t/\tFALSE\t2147483647\ta\tb=c\n"));
         assert!(needs_login("ERROR: [Instagram] abc: Requested content is not available, rate-limit reached or login required"));
+        // words that only contain "age" or "bot" must not trigger a login retry
+        assert!(!needs_login("ERROR: unable to download webpage: message about both"));
+    }
+
+    #[test]
+    fn same_page_is_answered_from_cache() {
+        let url = "https://example.test/cached-video";
+        let slot = cache_slot(url);
+        let info = YtInfo { title: "T".into(), site: "S".into(), options: vec![] };
+        *slot.lock().unwrap() = Some((Instant::now(), info));
+        // no yt-dlp needed: the answer is already there
+        assert_eq!(resolve(url, None).unwrap().title, "T");
     }
 }
